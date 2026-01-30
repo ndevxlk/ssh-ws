@@ -1,0 +1,189 @@
+#!/bin/bash
+show_menu() {
+	echo
+	cat <<-MENU
+    ====================================
+      SSH WebSocket Manager by NDEVXLK
+    ====================================
+    1) Install Script
+    2) Uninstall Script
+    3) Install UDPGW
+    4) Add SSH User
+    5) Remove SSH User
+    6) List SSH Users
+    7) Change SSH Banner
+    8) Get SSH WS Payload
+    9) Exit
+	MENU
+}
+install_script() {
+    echo
+    read -p 'Enter domain name: ' DOMAIN_NAME
+    if [[ ! $DOMAIN_NAME =~ ^(([a-zA-Z0-9-]+\.)+[a-zA-Z]{2,})$ ]]; then
+        echo -e '\nEntered domain name is invalid.'
+        exit 0
+    fi
+    PUBLIC_IP=$(curl -4 https://api.ipify.org)
+    if ! nslookup $DOMAIN_NAME | grep -q "$PUBLIC_IP"; then
+        echo -e '\nEntered domain name is not working.'
+        exit 0
+    fi
+    sudo bash -c 'cat > /etc/issue.net' << 'EOF'
+SSH WebSocket Manager by NDEVXLK
+EOF
+    sudo sed -i 's/^#PasswordAuthentication.*/PasswordAuthentication yes/' /etc/ssh/sshd_config
+    sudo sed -i 's/^#Banner.*/Banner \/etc\/issue.net/' /etc/ssh/sshd_config
+    sudo systemctl restart ssh
+    sudo apt update -y
+    if [ ! -d '/etc/nginx' ]; then
+        sudo apt install nginx -y
+        sudo systemctl enable nginx
+        sudo systemctl start nginx
+        if [ ! -d '/etc/ssl/cert' ]; then
+            sudo mkdir /etc/ssl/cert
+            sudo mkdir /etc/ssl/cert/$DOMAIN_NAME
+            CERT_PATH="/etc/ssl/cert/$DOMAIN_NAME"
+            sudo curl https://get.acme.sh | sh
+            sudo ~/.acme.sh/acme.sh --register-account -m my@example.com
+            sudo ~/.acme.sh/acme.sh --server letsencrypt --issue -d "$DOMAIN_NAME" -w /var/www/html --keylength ec-256 --key-file "$CERT_PATH/privkey.pem" --fullchain-file "$CERT_PATH/fullchain.pem"
+        fi
+        sudo bash -c 'cat > /etc/nginx/sites-enabled/default' << EOF
+server {
+    listen 80;
+    listen [::]:80;
+    listen 443 ssl http2;
+    listen [::]:443 ssl http2;
+    server_name $DOMAIN_NAME;
+    ssl_certificate $CERT_PATH/fullchain.pem;
+    ssl_certificate_key $CERT_PATH/privkey.pem;
+    ssl_protocols TLSv1.2 TLSv1.3;
+    location ^~ /.well-known/acme-challenge/ {
+        root /var/www/html;
+        allow all;
+        default_type "text/plain";
+        try_files $uri = 404;
+    }
+    location / {
+        proxy_pass http://127.0.0.1:3000;
+    }
+}
+EOF
+        sudo systemctl restart nginx
+    fi
+    if [ ! -d '/opt/ssh-ws' ]; then
+        sudo mkdir /opt/ssh-ws
+        sudo wget -4 -O /opt/ssh-ws/ssh-ws.py 'https://raw.githubusercontent.com/ndevxlk/ssh-ws/main/ssh-ws.py'
+        sudo bash -c 'cat > /etc/systemd/system/ssh-ws.service' << 'EOF'
+[Unit]
+Description = Python Proxy Service
+After = network.target
+[Service]
+Type = simple
+User = root
+ExecStart = /usr/bin/python3 /opt/ssh-ws/ssh-ws.py
+Restart = always
+[Install]
+WantedBy = multi-user.target
+EOF
+        sudo systemctl daemon-reload
+        sudo systemctl enable ssh-ws.service
+        sudo systemctl start ssh-ws.service
+    fi
+    install_udpgw
+    echo -e '\nSSH script was installed successfully.'
+}
+uninstall_script() {
+    echo
+    read -rp 'Press enter to continue...' _
+    sudo systemctl stop nginx
+    sudo systemctl disable nginx
+    sudo apt remove --purge nginx nginx-common nginx-full
+    sudo rm -rf /etc/nginx
+    sudo rm -rf /root/.acme.sh
+    sudo rm -rf /etc/ssl/cert
+    sudo systemctl stop ssh-ws.service
+    sudo systemctl disable ssh-ws.service
+    sudo rm /etc/systemd/system/ssh-ws.service
+    sudo rm -rf /opt/ssh-ws
+    sudo systemctl stop badvpn-udpgw.service
+    sudo systemctl disable badvpn-udpgw.service
+    sudo rm /etc/systemd/system/badvpn-udpgw.service
+    sudo rm /usr/bin/badvpn-udpgw
+    sudo systemctl daemon-reload
+    echo -e '\nSSH script was uninstalled successfully.'
+}
+install_udpgw() {
+    if [ ! -f '/usr/bin/badvpn-udpgw' ]; then
+        sudo wget -4 -O /usr/bin/badvpn-udpgw 'https://raw.githubusercontent.com/ndevxlk/ssh-ws/main/badvpn-udpgw64'
+        sudo chmod +x /usr/bin/badvpn-udpgw
+        sudo bash -c 'cat > /etc/systemd/system/badvpn-udpgw.service' << 'EOF'
+[Unit]
+Description = badvpn-udpgw
+After = network.target
+[Service]
+Type = simple
+User = root
+ExecStart = /usr/bin/badvpn-udpgw --listen-addr 127.0.0.1:7300
+Restart = always
+[Install]
+WantedBy = multi-user.target
+EOF
+        sudo systemctl daemon-reload
+        sudo systemctl enable badvpn-udpgw.service
+        sudo systemctl start badvpn-udpgw.service
+    fi
+    echo -e '\nUDPGW was installed successfully.'
+}
+add_user() {
+    echo
+    read -p 'Enter SSH username: ' SSH_USERNAME
+    echo
+    read -p 'Enter SSH password: ' SSH_PASSWORD
+    echo
+    read -p 'Enter the validity period in days: ' VALIDITY_PERIOD
+    EXPIRY_DATE=$(date -d "+$VALIDITY_PERIOD days" +"%Y-%m-%d")
+    sudo useradd -e "$EXPIRY_DATE" -s /usr/sbin/nologin -M "$SSH_USERNAME"
+    echo "$SSH_USERNAME:$SSH_PASSWORD" | sudo chpasswd
+    echo -e '\nSSH user was added successfully.'
+}
+remove_user() {
+    echo
+    read -p 'Enter SSH username: ' SSH_USERNAME
+    sudo userdel -f -r $SSH_USERNAME > /dev/null 2>&1
+    echo -e '\nSSH user was removed successfully.'
+}
+list_users() {
+    echo
+    sudo awk -F: '$3>=1000 && $1!="nobody"{print $1}' /etc/passwd
+}
+change_banner() {
+    nano /etc/issue.net
+    echo -e '\nSSH banner was changed successfully.'
+}
+get_payload() {
+    echo
+    read -p 'Enter domain name: ' DOMAIN_NAME
+    echo -e "\nGET / HTTP/1.1[crlf]Host: $DOMAIN_NAME[crlf]Connection: Upgrade[crlf]Upgrade: Websocket[crlf][crlf]"
+}
+if [ "$EUID" -ne 0 ]; then
+    echo -e '\nYou must run this script as the root user!\n'
+    exit 1
+fi
+while true; do
+    show_menu
+    read -rp $'\nChoose an option. [1-9]: ' OPTION
+    case "$OPTION" in
+        1) install_script ;;
+        2) uninstall_script ;;
+        3) install_udpgw ;;
+        4) add_user ;;
+        5) remove_user ;;
+        6) list_users ;;
+        7) change_banner ;;
+        8) get_payload ;;
+        9) echo -e '\nBye.\n'; exit 0 ;;
+        *) echo -e '\nInvalid option. Choose 1-9.' ;;
+    esac
+    echo
+    read -rp 'Press enter to continue...' _
+done
